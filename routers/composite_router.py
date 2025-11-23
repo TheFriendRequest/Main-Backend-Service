@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Query, Header, Response, Request
+from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import httpx
@@ -7,7 +8,7 @@ import os
 from pydantic import BaseModel
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import verify_firebase_token, get_firebase_uid
+from auth import get_firebase_uid
 
 router = APIRouter(prefix="/api", tags=["Composite"])
 
@@ -34,12 +35,13 @@ async def forward_request(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     json_data: Optional[Dict] = None,
-    params: Optional[Dict] = None
-) -> Dict[str, Any]:
+    params: Optional[Dict] = None,
+    response_obj: Optional[Response] = None
+) -> Any:
     """Forward HTTP request to atomic service"""
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.request(
+            http_response = await client.request(
                 method=method,
                 url=url,
                 headers=headers or {},
@@ -47,8 +49,20 @@ async def forward_request(
                 params=params,
                 timeout=30.0
             )
-            response.raise_for_status()
-            return response.json() if response.content else {}
+            http_response.raise_for_status()
+            # Forward ETag header if present
+            if response_obj:
+                etag = http_response.headers.get("ETag") or http_response.headers.get("etag")
+                print(f"[Composite Service] Received ETag from atomic service: {etag}")
+                if etag:
+                    response_obj.headers["ETag"] = etag
+                    print(f"[Composite Service] Forwarded ETag to client: {response_obj.headers.get('ETag')}")
+                else:
+                    print(f"[Composite Service] No ETag found in atomic service response")
+                    print(f"[Composite Service] Available headers: {list(http_response.headers.keys())}")
+            if not http_response.content:
+                return [] if method == "GET" else {}
+            return http_response.json()
     except httpx.HTTPStatusError as e:
         # Re-raise with more context
         error_detail = f"Atomic service error: {e.response.status_code}"
@@ -376,6 +390,7 @@ async def get_user_activity(
 @router.get("/users/me")
 async def get_current_user(
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """Delegate to Users Service - Get current authenticated user"""
@@ -384,11 +399,15 @@ async def get_current_user(
     if authorization:
         headers["Authorization"] = authorization
     
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/me",
-        headers=headers
+        headers=headers,
+        response_obj=response
     )
+    # Return JSONResponse with headers from the Response object
+    response_headers = dict(response.headers)
+    return JSONResponse(content=result, headers=response_headers)
 
 
 @router.post("/users/sync", status_code=status.HTTP_201_CREATED)
@@ -488,6 +507,7 @@ async def update_user(
 async def get_user_schedules(
     user_id: int,
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """Delegate to Users Service"""
@@ -496,11 +516,15 @@ async def get_user_schedules(
     if authorization:
         headers["Authorization"] = authorization
     
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/{user_id}/schedules",
-        headers=headers
+        headers=headers,
+        response_obj=response
     )
+    # Return JSONResponse with headers from the Response object
+    response_headers = dict(response.headers)
+    return JSONResponse(content=result, headers=response_headers)
 
 
 @router.post("/users/{user_id}/schedules", status_code=status.HTTP_201_CREATED)
@@ -618,6 +642,7 @@ async def update_user_interests(
 @router.get("/events")
 async def get_events(
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
@@ -636,18 +661,23 @@ async def get_events(
     if created_by:
         params["created_by"] = created_by
     
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{EVENTS_SERVICE_URL}/events/",
         headers=headers,
-        params=params
+        params=params,
+        response_obj=response
     )
+    # Return JSONResponse with headers from the Response object
+    response_headers = dict(response.headers)
+    return JSONResponse(content=result, headers=response_headers)
 
 
 @router.get("/events/{event_id}")
 async def get_event(
     event_id: int,
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     if_none_match: Optional[str] = Header(None, alias="If-None-Match")
 ):
@@ -660,15 +690,27 @@ async def get_event(
         headers["If-None-Match"] = if_none_match
     
     async with httpx.AsyncClient() as client:
-        response = await client.get(
+        http_response = await client.get(
             f"{EVENTS_SERVICE_URL}/events/{event_id}",
             headers=headers,
             timeout=10.0
         )
-        if response.status_code == 304:
-            return Response(status_code=304)
-        response.raise_for_status()
-        return response.json() if response.content else {}
+        if http_response.status_code == 304:
+            # Forward ETag header from atomic service
+            etag = http_response.headers.get("ETag") or http_response.headers.get("etag")
+            response_obj = Response(status_code=304)
+            if etag:
+                response_obj.headers["ETag"] = etag
+            return response_obj
+        
+        http_response.raise_for_status()
+        # Forward ETag header from atomic service
+        etag = http_response.headers.get("ETag") or http_response.headers.get("etag")
+        response_headers = {}
+        if etag:
+            response_headers["ETag"] = etag
+        content = http_response.json() if http_response.content else {}
+        return JSONResponse(content=content, headers=response_headers)
 
 
 @router.post("/events", status_code=status.HTTP_201_CREATED)
@@ -728,6 +770,7 @@ async def update_event(
 @router.get("/posts")
 async def get_posts(
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
@@ -746,18 +789,23 @@ async def get_posts(
     if created_by:
         params["created_by"] = created_by
     
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{FEED_SERVICE_URL}/posts/",
         headers=headers,
-        params=params
+        params=params,
+        response_obj=response
     )
+    # Return JSONResponse with headers from the Response object
+    response_headers = dict(response.headers)
+    return JSONResponse(content=result, headers=response_headers)
 
 
 @router.get("/posts/{post_id}")
 async def get_post(
     post_id: int,
     request: Request,
+    response: Response,
     firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """Delegate to Feed Service"""
@@ -766,11 +814,15 @@ async def get_post(
     if authorization:
         headers["Authorization"] = authorization
     
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{FEED_SERVICE_URL}/posts/{post_id}",
-        headers=headers
+        headers=headers,
+        response_obj=response
     )
+    # Return JSONResponse with headers from the Response object
+    response_headers = dict(response.headers)
+    return JSONResponse(content=result, headers=response_headers)
 
 
 @router.post("/posts", status_code=status.HTTP_201_CREATED)

@@ -14,6 +14,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag", "etag", "Location", "Content-Type"]  # Expose ETag header to frontend
 )
 
 app.include_router(composite_router.router)
