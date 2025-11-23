@@ -1,0 +1,820 @@
+from fastapi import APIRouter, HTTPException, Depends, status, Query, Header, Response, Request
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import httpx
+import threading
+import os
+from pydantic import BaseModel
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from auth import verify_firebase_token, get_firebase_uid
+
+router = APIRouter(prefix="/api", tags=["Composite"])
+
+# ----------------------
+# Configuration
+# ----------------------
+USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://localhost:8001")
+EVENTS_SERVICE_URL = os.getenv("EVENTS_SERVICE_URL", "http://localhost:8002")
+FEED_SERVICE_URL = os.getenv("FEED_SERVICE_URL", "http://localhost:8003")
+
+# ----------------------
+# Helper: Extract Authorization header (for forwarding to atomic services)
+# ----------------------
+def get_auth_header(request: Request) -> Optional[str]:
+    """Extract authorization header for forwarding to atomic services"""
+    return request.headers.get("Authorization") or request.headers.get("authorization")
+
+
+# ----------------------
+# Helper: Forward request to atomic service
+# ----------------------
+async def forward_request(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    json_data: Optional[Dict] = None,
+    params: Optional[Dict] = None
+) -> Dict[str, Any]:
+    """Forward HTTP request to atomic service"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=headers or {},
+                json=json_data,
+                params=params,
+                timeout=30.0
+            )
+            response.raise_for_status()
+            return response.json() if response.content else {}
+    except httpx.HTTPStatusError as e:
+        # Re-raise with more context
+        error_detail = f"Atomic service error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            if "detail" in error_body:
+                error_detail = error_body["detail"]
+        except:
+            error_detail = e.response.text or str(e)
+        raise HTTPException(status_code=e.response.status_code, detail=error_detail)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Cannot connect to atomic service: {str(e)}")
+
+
+# ----------------------
+# Helper: Validate logical foreign key constraints
+# ----------------------
+async def validate_user_exists(user_id: int, auth_header: Optional[str]) -> bool:
+    """Validate that a user exists (logical FK constraint)"""
+    try:
+        headers = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{USERS_SERVICE_URL}/users/",
+                headers=headers,
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                users = response.json()
+                return any(u.get("user_id") == user_id for u in users)
+        return False
+    except Exception:
+        return False
+
+
+async def validate_event_exists(event_id: int, auth_header: Optional[str]) -> bool:
+    """Validate that an event exists (logical FK constraint)"""
+    try:
+        headers = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{EVENTS_SERVICE_URL}/events/{event_id}",
+                headers=headers,
+                timeout=10.0
+            )
+            return response.status_code == 200
+    except Exception:
+        return False
+
+
+async def validate_post_exists(post_id: int, auth_header: Optional[str]) -> bool:
+    """Validate that a post exists (logical FK constraint)"""
+    try:
+        headers = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{FEED_SERVICE_URL}/posts/{post_id}",
+                headers=headers,
+                timeout=10.0
+            )
+            return response.status_code == 200
+    except Exception:
+        return False
+
+
+# ----------------------
+# Composite Models
+# ----------------------
+class UserFeedResponse(BaseModel):
+    user: Dict[str, Any]
+    posts: List[Dict[str, Any]]
+    events: List[Dict[str, Any]]
+
+
+class UserEventPostResponse(BaseModel):
+    user_id: int
+    user: Optional[Dict[str, Any]] = None
+    events: List[Dict[str, Any]] = []
+    posts: List[Dict[str, Any]] = []
+
+
+# ----------------------
+# Composite Endpoints - Parallel Execution
+# ----------------------
+@router.get("/users/{user_id}/feed", response_model=UserFeedResponse)
+async def get_user_feed(
+    user_id: int,
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
+    skip_posts: int = Query(0, ge=0),
+    limit_posts: int = Query(10, ge=1, le=100),
+    skip_events: int = Query(0, ge=0),
+    limit_events: int = Query(10, ge=1, le=100)
+):
+    """
+    Get user feed with posts and events in parallel.
+    Demonstrates thread-based parallel execution.
+    Implements logical FK constraint: validates user exists.
+    """
+    authorization = get_auth_header(request)
+    # Validate user exists (logical FK constraint)
+    if not await validate_user_exists(user_id, authorization):
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    # Results storage
+    results = {"user": None, "posts": [], "events": []}
+    errors = {}
+    
+    # Thread function for fetching user
+    def fetch_user():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{USERS_SERVICE_URL}/users/",
+                        headers=headers,
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        users = resp.json()
+                        for u in users:
+                            if u.get("user_id") == user_id:
+                                results["user"] = u
+                                break
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["user"] = str(e)
+    
+    # Thread function for fetching posts
+    def fetch_posts():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{FEED_SERVICE_URL}/posts/",
+                        headers=headers,
+                        params={"created_by": user_id, "skip": skip_posts, "limit": limit_posts},
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results["posts"] = data.get("items", [])
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["posts"] = str(e)
+    
+    # Thread function for fetching events
+    def fetch_events():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{EVENTS_SERVICE_URL}/events/",
+                        headers=headers,
+                        params={"created_by": user_id, "skip": skip_events, "limit": limit_events},
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results["events"] = data.get("items", [])
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["events"] = str(e)
+    
+    # Execute in parallel using threads
+    threads = [
+        threading.Thread(target=fetch_user),
+        threading.Thread(target=fetch_posts),
+        threading.Thread(target=fetch_events)
+    ]
+    
+    for thread in threads:
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
+    
+    # Check for errors
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Errors fetching data: {errors}"
+        )
+    
+    if not results["user"]:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return UserFeedResponse(
+        user=results["user"],
+        posts=results["posts"],
+        events=results["events"]
+    )
+
+
+@router.get("/users/{user_id}/activity", response_model=UserEventPostResponse)
+async def get_user_activity(
+    user_id: int,
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """
+    Get all user activity (events and posts) in parallel.
+    Demonstrates thread-based parallel execution.
+    Implements logical FK constraint: validates user exists.
+    """
+    authorization = get_auth_header(request)
+    # Validate user exists (logical FK constraint)
+    if not await validate_user_exists(user_id, authorization):
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    results = {"user": None, "events": [], "posts": []}
+    errors = {}
+    
+    # Thread function for fetching user
+    def fetch_user():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{USERS_SERVICE_URL}/users/",
+                        headers=headers,
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        users = resp.json()
+                        for u in users:
+                            if u.get("user_id") == user_id:
+                                results["user"] = u
+                                break
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["user"] = str(e)
+    
+    # Thread function for fetching all events
+    def fetch_events():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{EVENTS_SERVICE_URL}/events/",
+                        headers=headers,
+                        params={"created_by": user_id, "limit": 100},
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results["events"] = data.get("items", [])
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["events"] = str(e)
+    
+    # Thread function for fetching all posts
+    def fetch_posts():
+        try:
+            async def _fetch():
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{FEED_SERVICE_URL}/posts/",
+                        headers=headers,
+                        params={"created_by": user_id, "limit": 100},
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results["posts"] = data.get("items", [])
+            import asyncio
+            asyncio.run(_fetch())
+        except Exception as e:
+            errors["posts"] = str(e)
+    
+    # Execute in parallel using threads
+    threads = [
+        threading.Thread(target=fetch_user),
+        threading.Thread(target=fetch_events),
+        threading.Thread(target=fetch_posts)
+    ]
+    
+    for thread in threads:
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
+    
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Errors fetching data: {errors}"
+        )
+    
+    return UserEventPostResponse(
+        user_id=user_id,
+        user=results["user"],
+        events=results["events"],
+        posts=results["posts"]
+    )
+
+
+# ----------------------
+# Composite Endpoints - Delegating to Atomic Services
+# ----------------------
+@router.get("/users/me")
+async def get_current_user(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service - Get current authenticated user"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/me",
+        headers=headers
+    )
+
+
+@router.post("/users/sync", status_code=status.HTTP_201_CREATED)
+async def sync_user(
+    user_data: Dict[str, Any],
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service - Sync Firebase user to database"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    result = await forward_request(
+        "POST",
+        f"{USERS_SERVICE_URL}/users/sync",
+        headers=headers,
+        json_data=user_data
+    )
+    
+    return result
+
+
+@router.get("/users")
+async def get_users(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/",
+        headers=headers,
+        params={"skip": skip, "limit": limit} if skip or limit else None
+    )
+
+
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    # Get all users and find the one with matching user_id
+    users = await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/",
+        headers=headers
+    )
+    
+    if isinstance(users, list):
+        for user in users:
+            if isinstance(user, dict) and user.get("user_id") == user_id:
+                return user
+    
+    raise HTTPException(status_code=404, detail="User not found")
+
+
+@router.put("/users/{user_id}")
+async def update_user(
+    user_id: int,
+    user_data: Dict[str, Any],
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    return await forward_request(
+        "PUT",
+        f"{USERS_SERVICE_URL}/users/{user_id}",
+        headers=headers,
+        json_data=user_data
+    )
+
+
+@router.get("/users/{user_id}/schedules")
+async def get_user_schedules(
+    user_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/{user_id}/schedules",
+        headers=headers
+    )
+
+
+@router.post("/users/{user_id}/schedules", status_code=status.HTTP_201_CREATED)
+async def create_user_schedule(
+    user_id: int,
+    schedule: Dict[str, Any],
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    result = await forward_request(
+        "POST",
+        f"{USERS_SERVICE_URL}/users/{user_id}/schedules",
+        headers=headers,
+        json_data=schedule
+    )
+    
+    if "schedule_id" in result:
+        response.headers["Location"] = f"/api/users/{user_id}/schedules/{result['schedule_id']}"
+    
+    return result
+
+
+@router.delete("/users/{user_id}/schedules/{schedule_id}")
+async def delete_user_schedule(
+    user_id: int,
+    schedule_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "DELETE",
+        f"{USERS_SERVICE_URL}/users/{user_id}/schedules/{schedule_id}",
+        headers=headers
+    )
+
+
+@router.get("/users/interests")
+async def get_interests(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service - Get all available interests"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/interests",
+        headers=headers
+    )
+
+
+@router.get("/users/{user_id}/interests")
+async def get_user_interests(
+    user_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/{user_id}/interests",
+        headers=headers
+    )
+
+
+@router.post("/users/{user_id}/interests", status_code=status.HTTP_201_CREATED)
+async def update_user_interests(
+    user_id: int,
+    interest_ids: List[int],
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Users Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    # Forward as JSON body (interest_ids is a list, not a dict)
+    async with httpx.AsyncClient() as client:
+        response_http = await client.post(
+            f"{USERS_SERVICE_URL}/users/{user_id}/interests",
+            headers=headers,
+            json=interest_ids,
+            timeout=30.0
+        )
+        response_http.raise_for_status()
+        return response_http.json() if response_http.content else {}
+
+
+@router.get("/events")
+async def get_events(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    location: Optional[str] = None,
+    created_by: Optional[int] = None
+):
+    """Delegate to Events Service with query parameters"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    params: Dict[str, Any] = {"skip": skip, "limit": limit}
+    if location:
+        params["location"] = location
+    if created_by:
+        params["created_by"] = created_by
+    
+    return await forward_request(
+        "GET",
+        f"{EVENTS_SERVICE_URL}/events/",
+        headers=headers,
+        params=params
+    )
+
+
+@router.get("/events/{event_id}")
+async def get_event(
+    event_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match")
+):
+    """Delegate to Events Service with eTag support"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    if if_none_match:
+        headers["If-None-Match"] = if_none_match
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{EVENTS_SERVICE_URL}/events/{event_id}",
+            headers=headers,
+            timeout=10.0
+        )
+        if response.status_code == 304:
+            return Response(status_code=304)
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+
+@router.post("/events", status_code=status.HTTP_201_CREATED)
+async def create_event(
+    event: Dict[str, Any],
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Events Service - validates user exists (logical FK)"""
+    authorization = get_auth_header(request)
+    # Validate user exists if created_by is provided
+    if "created_by" in event:
+        if not await validate_user_exists(event["created_by"], authorization):
+            raise HTTPException(status_code=400, detail="User not found (logical FK constraint)")
+    
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    result = await forward_request(
+        "POST",
+        f"{EVENTS_SERVICE_URL}/events/",
+        headers=headers,
+        json_data=event
+    )
+    
+    if "event_id" in result:
+        response.headers["Location"] = f"/api/events/{result['event_id']}"
+    
+    return result
+
+
+@router.put("/events/{event_id}")
+async def update_event(
+    event_id: int,
+    event_data: Dict[str, Any],
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Events Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    return await forward_request(
+        "PUT",
+        f"{EVENTS_SERVICE_URL}/events/{event_id}",
+        headers=headers,
+        json_data=event_data
+    )
+
+
+@router.get("/posts")
+async def get_posts(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    interest_id: Optional[int] = None,
+    created_by: Optional[int] = None
+):
+    """Delegate to Feed Service with query parameters"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    params: Dict[str, Any] = {"skip": skip, "limit": limit}
+    if interest_id:
+        params["interest_id"] = interest_id
+    if created_by:
+        params["created_by"] = created_by
+    
+    return await forward_request(
+        "GET",
+        f"{FEED_SERVICE_URL}/posts/",
+        headers=headers,
+        params=params
+    )
+
+
+@router.get("/posts/{post_id}")
+async def get_post(
+    post_id: int,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Feed Service"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{FEED_SERVICE_URL}/posts/{post_id}",
+        headers=headers
+    )
+
+
+@router.post("/posts", status_code=status.HTTP_201_CREATED)
+async def create_post(
+    post: Dict[str, Any],
+    response: Response,
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Feed Service - validates user exists (logical FK)"""
+    authorization = get_auth_header(request)
+    # Note: created_by is set from auth token in Feed Service, but we validate here too
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    headers["Content-Type"] = "application/json"
+    
+    result = await forward_request(
+        "POST",
+        f"{FEED_SERVICE_URL}/posts/",
+        headers=headers,
+        json_data=post
+    )
+    
+    if "post_id" in result:
+        response.headers["Location"] = f"/api/posts/{result['post_id']}"
+    
+    return result
+
+
+@router.get("/posts/interests")
+async def get_post_interests(
+    request: Request,
+    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
+):
+    """Delegate to Feed Service - Get all available interests for posts"""
+    authorization = get_auth_header(request)
+    headers: Dict[str, str] = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    
+    return await forward_request(
+        "GET",
+        f"{FEED_SERVICE_URL}/posts/interests/",
+        headers=headers
+    )
+
