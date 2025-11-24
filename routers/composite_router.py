@@ -15,9 +15,9 @@ router = APIRouter(prefix="/api", tags=["Composite"])
 # ----------------------
 # Configuration
 # ----------------------
-USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://localhost:8001")
-EVENTS_SERVICE_URL = os.getenv("EVENTS_SERVICE_URL", "http://localhost:8002")
-FEED_SERVICE_URL = os.getenv("FEED_SERVICE_URL", "http://localhost:8003")
+USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://localhost:8002")
+EVENTS_SERVICE_URL = os.getenv("EVENTS_SERVICE_URL", "http://localhost:8003")
+FEED_SERVICE_URL = os.getenv("FEED_SERVICE_URL", "http://localhost:8004")
 
 # ----------------------
 # Helper: Extract Authorization header (for forwarding to atomic services)
