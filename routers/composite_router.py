@@ -2,17 +2,17 @@ from fastapi import APIRouter, HTTPException, Depends, status, Query, Header, Re
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List, cast
 from datetime import datetime
-import httpx
+import httpx  # type: ignore
 import threading
 import os
-import mysql.connector
+import mysql.connector  # type: ignore
 import json
 import uuid
 import time
 from pydantic import BaseModel
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import get_firebase_uid, get_verified_token
+# Authentication removed - trust x-firebase-uid header from API Gateway
 
 router = APIRouter(prefix="/api", tags=["Composite"])
 
@@ -51,6 +51,18 @@ def get_auth_header(request: Request) -> Optional[str]:
     return request.headers.get("Authorization") or request.headers.get("authorization")
 
 
+# Helper: Get firebase_uid from request state (set by API Gateway middleware)
+def get_firebase_uid_from_request(request: Request) -> str:
+    """Get firebase_uid from request state (injected by API Gateway middleware)"""
+    firebase_uid = getattr(request.state, "firebase_uid", None)
+    if not firebase_uid:
+        # Also check header in case middleware didn't set state
+        firebase_uid = request.headers.get("x-firebase-uid") or request.headers.get("X-Firebase-Uid")
+    if not firebase_uid:
+        raise HTTPException(status_code=401, detail="Authentication required - x-firebase-uid header missing")
+    return firebase_uid
+
+
 # ----------------------
 # Helper: Forward request to atomic service
 # ----------------------
@@ -60,15 +72,28 @@ async def forward_request(
     headers: Optional[Dict[str, str]] = None,
     json_data: Optional[Dict] = None,
     params: Optional[Dict] = None,
-    response_obj: Optional[Response] = None
+    response_obj: Optional[Response] = None,
+    firebase_uid: Optional[str] = None
 ) -> Any:
-    """Forward HTTP request to atomic service"""
+    """Forward HTTP request to atomic service with x-firebase-uid header"""
+    # Prepare headers
+    forward_headers = headers.copy() if headers else {}
+    
+    # Always include x-firebase-uid header for downstream services
+    if firebase_uid:
+        forward_headers["x-firebase-uid"] = firebase_uid
+    elif "x-firebase-uid" not in forward_headers and headers:
+        # Try to get from existing headers
+        forward_headers["x-firebase-uid"] = headers.get("x-firebase-uid") or headers.get("X-Firebase-Uid", "")
+    
+    forward_headers["Content-Type"] = "application/json"
+    
     try:
         async with httpx.AsyncClient() as client:
             http_response = await client.request(
                 method=method,
                 url=url,
-                headers=headers or {},
+                headers=forward_headers,
                 json=json_data,
                 params=params,
                 timeout=30.0
@@ -121,15 +146,14 @@ async def forward_request(
 # ----------------------
 # Helper: Get user_id from firebase_uid via User Service
 # ----------------------
-async def get_user_id_from_firebase_uid(firebase_uid: str, auth_header: Optional[str], decoded_token: Optional[Dict[str, Any]] = None) -> Optional[int]:
+async def get_user_id_from_firebase_uid(firebase_uid: str, auth_header: Optional[str] = None, decoded_token: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """
     Get user_id from User Service using firebase_uid.
     If user doesn't exist and decoded_token is provided, attempts to auto-sync the user.
+    Now uses x-firebase-uid header instead of Authorization.
     """
     try:
-        headers = {}
-        if auth_header:
-            headers["Authorization"] = auth_header
+        headers = {"x-firebase-uid": firebase_uid}
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -193,10 +217,10 @@ async def get_user_id_from_firebase_uid(firebase_uid: str, auth_header: Optional
 # ----------------------
 # Helper: Ensure local user exists (create if needed)
 # ----------------------
-async def ensure_local_user(firebase_uid: str, auth_header: Optional[str], user_data: Optional[Dict[str, Any]] = None) -> Optional[int]:
+async def ensure_local_user(firebase_uid: str, auth_header: Optional[str] = None, user_data: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """Ensure local user exists, create if needed. Returns user_id."""
     # First try to get existing user
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, auth_header)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if user_id:
         return user_id
     
@@ -227,12 +251,12 @@ async def ensure_local_user(firebase_uid: str, auth_header: Optional[str], user_
 # ----------------------
 # Helper: Validate logical foreign key constraints
 # ----------------------
-async def validate_user_exists(user_id: int, auth_header: Optional[str]) -> bool:
-    """Validate that a user exists (logical FK constraint)"""
+async def validate_user_exists(user_id: int, firebase_uid: Optional[str] = None) -> bool:
+    """Validate that a user exists (logical FK constraint). Uses x-firebase-uid header."""
     try:
         headers = {}
-        if auth_header:
-            headers["Authorization"] = auth_header
+        if firebase_uid:
+            headers["x-firebase-uid"] = firebase_uid
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -248,12 +272,12 @@ async def validate_user_exists(user_id: int, auth_header: Optional[str]) -> bool
         return False
 
 
-async def validate_event_exists(event_id: int, auth_header: Optional[str]) -> bool:
-    """Validate that an event exists (logical FK constraint)"""
+async def validate_event_exists(event_id: int, firebase_uid: Optional[str] = None) -> bool:
+    """Validate that an event exists (logical FK constraint). Uses x-firebase-uid header."""
     try:
         headers = {}
-        if auth_header:
-            headers["Authorization"] = auth_header
+        if firebase_uid:
+            headers["x-firebase-uid"] = firebase_uid
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -266,12 +290,12 @@ async def validate_event_exists(event_id: int, auth_header: Optional[str]) -> bo
         return False
 
 
-async def validate_post_exists(post_id: int, auth_header: Optional[str]) -> bool:
-    """Validate that a post exists (logical FK constraint)"""
+async def validate_post_exists(post_id: int, firebase_uid: Optional[str] = None) -> bool:
+    """Validate that a post exists (logical FK constraint). Uses x-firebase-uid header."""
     try:
         headers = {}
-        if auth_header:
-            headers["Authorization"] = auth_header
+        if firebase_uid:
+            headers["x-firebase-uid"] = firebase_uid
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -308,17 +332,18 @@ async def get_user_feed(
     user_id: int,
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     skip_posts: int = Query(0, ge=0),
-    limit_posts: int = Query(10, ge=1, le=100),
+    limit_posts: int = Query(5, ge=1, le=100),
     skip_events: int = Query(0, ge=0),
-    limit_events: int = Query(10, ge=1, le=100)
+    limit_events: int = Query(5, ge=1, le=100)
 ):
     """
     Get user feed with posts and events in parallel.
     Demonstrates thread-based parallel execution.
     Implements logical FK constraint: validates user exists.
+    Trusts x-firebase-uid from API Gateway.
     """
+    firebase_uid = get_firebase_uid_from_request(request)
     authorization = get_auth_header(request)
     # Validate user exists (logical FK constraint)
     if not await validate_user_exists(user_id, authorization):
@@ -412,7 +437,7 @@ async def get_user_feed(
         )
     
     if not results["user"]:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found") 
     
     return UserFeedResponse(
         user=results["user"],
@@ -426,21 +451,19 @@ async def get_user_activity(
     user_id: int,
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Get all user activity (events and posts) in parallel.
     Demonstrates thread-based parallel execution.
     Implements logical FK constraint: validates user exists.
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     # Validate user exists (logical FK constraint)
-    if not await validate_user_exists(user_id, authorization):
+    if not await validate_user_exists(user_id, firebase_uid):
         raise HTTPException(status_code=404, detail="User not found")
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
+    headers: Dict[str, str] = {"x-firebase-uid": firebase_uid}
     
     results = {"user": None, "events": [], "posts": []}
     errors = {}
@@ -538,19 +561,17 @@ async def get_user_activity(
 async def get_current_user(
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service - Get current authenticated user"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service - Get current authenticated user. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     result = await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/me",
         headers=headers,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     # Return JSONResponse with headers from the Response object
     response_headers = dict(response.headers)
@@ -561,21 +582,42 @@ async def get_current_user(
 async def sync_user(
     user_data: Dict[str, Any],
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service - Sync Firebase user to database"""
-    authorization = get_auth_header(request)
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    """Delegate to Users Service - Sync Firebase user to database. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     result = await forward_request(
         "POST",
         f"{USERS_SERVICE_URL}/users/sync",
         headers=headers,
+        firebase_uid=firebase_uid,
         json_data=user_data
     )
+    
+    # If a new user was created (status code 201 or status="created"), publish to Pub/Sub for welcome email
+    if isinstance(result, dict) and result.get("status") == "created":
+        user_id = result.get("user_id")
+        firebase_uid_result = result.get("firebase_uid", firebase_uid)
+        email = user_data.get("email", "")
+        first_name = user_data.get("first_name", "User")
+        role = result.get("role", "user")
+        
+        if user_id and email:
+            try:
+                from pubsub.publishers import publish_user_created
+                publish_user_created(
+                    user_id=user_id,
+                    firebase_uid=firebase_uid_result,
+                    email=email,
+                    first_name=first_name,
+                    role=role
+                )
+            except Exception as e:
+                # Don't fail the request if Pub/Sub publishing fails
+                print(f"⚠️  Failed to publish user-created to Pub/Sub: {e}")
+                import traceback
+                traceback.print_exc()
     
     return result
 
@@ -583,39 +625,35 @@ async def sync_user(
 @router.get("/users")
 async def get_users(
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100)
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     return await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/",
         headers=headers,
-        params={"skip": skip, "limit": limit} if skip or limit else None
+        params={"skip": skip, "limit": limit} if skip or limit else None,
+        firebase_uid=firebase_uid
     )
 
 @router.get("/users/interests")
 async def get_interests(
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service - Get all available interests"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service - Get all available interests. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     try:
         result = await forward_request(
             "GET",
             f"{USERS_SERVICE_URL}/users/interests",
-            headers=headers
+            headers=headers,
+            firebase_uid=firebase_uid
         )
         # Ensure we return a list - use JSONResponse to avoid FastAPI validation issues
         if isinstance(result, list):
@@ -635,19 +673,17 @@ async def get_interests(
 async def get_user(
     user_id: int,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     # Get all users and find the one with matching user_id
     users = await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/",
-        headers=headers
+        headers=headers,
+        firebase_uid=firebase_uid
     )
     
     if isinstance(users, list):
@@ -663,20 +699,17 @@ async def update_user(
     user_id: int,
     user_data: Dict[str, Any],
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     return await forward_request(
         "PUT",
         f"{USERS_SERVICE_URL}/users/{user_id}",
         headers=headers,
-        json_data=user_data
+        json_data=user_data,
+        firebase_uid=firebase_uid
     )
 
 
@@ -685,19 +718,17 @@ async def get_user_schedules(
     user_id: int,
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     result = await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/{user_id}/schedules",
         headers=headers,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     # Return JSONResponse with headers from the Response object
     response_headers = dict(response.headers)
@@ -710,20 +741,17 @@ async def create_user_schedule(
     schedule: Dict[str, Any],
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     result = await forward_request(
         "POST",
         f"{USERS_SERVICE_URL}/users/{user_id}/schedules",
         headers=headers,
-        json_data=schedule
+        json_data=schedule,
+        firebase_uid=firebase_uid
     )
     
     if "schedule_id" in result:
@@ -737,18 +765,16 @@ async def delete_user_schedule(
     user_id: int,
     schedule_id: int,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """Delegate to Users Service"""
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     return await forward_request(
         "DELETE",
         f"{USERS_SERVICE_URL}/users/{user_id}/schedules/{schedule_id}",
-        headers=headers
+        headers=headers,
+        firebase_uid=firebase_uid
     )
 
 
@@ -756,18 +782,16 @@ async def delete_user_schedule(
 async def get_user_interests(
     user_id: int,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     return await forward_request(
         "GET",
         f"{USERS_SERVICE_URL}/users/{user_id}/interests",
-        headers=headers
+        headers=headers,
+        firebase_uid=firebase_uid
     )
 
 
@@ -777,14 +801,10 @@ async def update_user_interests(
     interest_ids: List[int],
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Users Service"""
-    authorization = get_auth_header(request)
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    """Delegate to Users Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {"Content-Type": "application/json", "x-firebase-uid": firebase_uid}
     
     # Forward as JSON body (interest_ids is a list, not a dict)
     async with httpx.AsyncClient() as client:
@@ -802,17 +822,14 @@ async def update_user_interests(
 async def get_events(
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
     location: Optional[str] = None,
     created_by: Optional[int] = None
 ):
-    """Delegate to Events Service with query parameters"""
-    authorization = get_auth_header(request)
+    """Delegate to Events Service with query parameters. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     params: Dict[str, Any] = {"skip": skip, "limit": limit}
     if location:
@@ -825,7 +842,8 @@ async def get_events(
         f"{EVENTS_SERVICE_URL}/events/",
         headers=headers,
         params=params,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     # Return JSONResponse with headers from the Response object
     response_headers = dict(response.headers)
@@ -837,14 +855,11 @@ async def get_event(
     event_id: int,
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
     if_none_match: Optional[str] = Header(None, alias="If-None-Match")
 ):
-    """Delegate to Events Service with eTag support"""
-    authorization = get_auth_header(request)
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
+    """Delegate to Events Service with eTag support. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {"x-firebase-uid": firebase_uid}
     if if_none_match:
         headers["If-None-Match"] = if_none_match
     
@@ -877,20 +892,19 @@ async def create_event(
     event: Dict[str, Any],
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
-    decoded_token: dict = Depends(get_verified_token)  # Get full token for auto-sync
 ):
     """
     Create event - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service (auto-sync if needed)
     3. Pass user_id to Event Service as created_by
     4. Enforce logical FK constraint
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service (auto-syncs if user doesn't exist)
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization, decoded_token)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid, None, None)
     if not user_id:
         raise HTTPException(
             status_code=404,
@@ -901,20 +915,61 @@ async def create_event(
     event["created_by"] = user_id
     # Note: No need to call validate_user_exists - get_user_id_from_firebase_uid already confirms user exists
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     result = await forward_request(
         "POST",
         f"{EVENTS_SERVICE_URL}/events/",
         headers=headers,
-        json_data=event
+        json_data=event,
+        firebase_uid=firebase_uid
     )
     
+    # Publish to Pub/Sub after successful event creation
+    print(f"[Composite Service] Event creation result: {result}")
+    print(f"[Composite Service] Result type: {type(result)}")
+    if isinstance(result, dict):
+        print(f"[Composite Service] Result keys: {list(result.keys())}")
+        print(f"[Composite Service] event_id in result: {'event_id' in result}")
+        if 'event_id' in result:
+            print(f"[Composite Service] event_id value: {result.get('event_id')}")
     if "event_id" in result:
-        response.headers["Location"] = f"/api/events/{result['event_id']}"
+        event_id_raw = result.get("event_id")
+        # Validate and convert event_id to int
+        if event_id_raw is None:
+            print(f"[Composite Service] ⚠️  event_id is None, skipping Pub/Sub publish")
+        else:
+            try:
+                event_id = int(event_id_raw)
+                print(f"[Composite Service] Event created with ID: {event_id}, attempting to publish to Pub/Sub...")
+                try:
+                    from pubsub.publishers import publish_event_created
+                    # Prepare event_data for Pub/Sub (convert any datetime objects to strings)
+                    event_data = result.copy()
+                    print(f"[Composite Service] Calling publish_event_created with event_id={event_id}, user_id={user_id}")
+                    message_id = publish_event_created(
+                        event_id=event_id,
+                        user_id=user_id,
+                        event_data=event_data
+                    )
+                    if message_id:
+                        print(f"[Composite Service] ✅ Successfully published to Pub/Sub: {message_id}")
+                    else:
+                        print(f"[Composite Service] ⚠️  Pub/Sub publishing returned None (check logs above)")
+                except Exception as e:
+                    # Don't fail the request if Pub/Sub publishing fails
+                    print(f"[Composite Service] ❌ Exception while publishing event to Pub/Sub: {e}")
+                    import traceback
+                    traceback.print_exc()
+            except (ValueError, TypeError) as e:
+                print(f"[Composite Service] ⚠️  Invalid event_id type: {event_id_raw}, error: {e}")
+                import traceback
+                traceback.print_exc()
+    else:
+        print(f"[Composite Service] ⚠️  No event_id in result, skipping Pub/Sub publish. Result keys: {result.keys() if isinstance(result, dict) else 'not a dict'}")
+    
+    if "event_id" in result:
+        response.headers["Location"] = f"/api/events/{result.get('event_id')}"
     
     return result
 
@@ -924,20 +979,19 @@ async def create_event_async(
     event: Dict[str, Any],
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
-    decoded_token: dict = Depends(get_verified_token)  # Get full token for auto-sync
 ):
     """
     Create event asynchronously - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service (auto-sync if needed)
     3. Pass user_id to Event Service as created_by
     4. Returns 202 Accepted with task ID for polling
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service (auto-syncs if user doesn't exist)
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization, decoded_token)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
@@ -947,10 +1001,7 @@ async def create_event_async(
     # Add created_by to event data
     event["created_by"] = user_id
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     # Forward to Event Service async endpoint
     result = await forward_request(
@@ -958,7 +1009,8 @@ async def create_event_async(
         f"{EVENTS_SERVICE_URL}/events/async",
         headers=headers,
         json_data=event,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     
     # Forward Location header if present
@@ -972,23 +1024,59 @@ async def create_event_async(
 async def get_event_task_status(
     task_id: str,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Poll the status of an async event creation task.
     Forwards to Event Service which stores tasks in event_db.
+    When task is completed, publishes to Pub/Sub if event was created.
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     # Forward to Event Service task status endpoint (tasks stored in event_db)
-    return await forward_request(
+    result = await forward_request(
         "GET",
         f"{EVENTS_SERVICE_URL}/events/tasks/{task_id}",
-        headers=headers
+        headers=headers,
+        firebase_uid=firebase_uid
     )
+    
+    # If task is completed and has event_id, publish to Pub/Sub
+    if isinstance(result, dict):
+        task_status = result.get("status")
+        if task_status == "completed":
+            # Event Service returns parsed event in "event" field when status is completed
+            event_data = result.get("event")
+            if isinstance(event_data, dict):
+                event_id = event_data.get("event_id")
+                user_id = event_data.get("created_by")
+                
+                if event_id and user_id:
+                    print(f"[Composite Service] Task {task_id} completed with event_id={event_id}, user_id={user_id}")
+                    print(f"[Composite Service] Publishing to Pub/Sub...")
+                    try:
+                        from pubsub.publishers import publish_event_created
+                        message_id = publish_event_created(
+                            event_id=event_id,
+                            user_id=user_id,
+                            event_data=event_data
+                        )
+                        if message_id:
+                            print(f"[Composite Service] Successfully published event-created to Pub/Sub: {message_id}")
+                        else:
+                            print(f"[Composite Service] Pub/Sub publishing returned None (check logs above)")
+                    except Exception as e:
+                        print(f"[Composite Service] Exception while publishing event to Pub/Sub: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"[Composite Service] Task completed but missing event_id or user_id: event_id={event_id}, user_id={user_id}")
+            else:
+                print(f"[Composite Service] Task completed but 'event' field is missing or not a dict: {type(event_data)}")
+                print(f"[Composite Service] Result keys: {list(result.keys())}")
+    
+    return result
 
 
 @router.put("/events/{event_id}")
@@ -996,28 +1084,25 @@ async def update_event(
     event_id: int,
     event_data: Dict[str, Any],
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Update event - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service
     3. Pass user_id to Event Service as query parameter for authorization
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
             detail="User not found. Please sync your account first."
         )
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     # Pass user_id as query parameter for authorization check in Event Service
     params = {"created_by": user_id}
@@ -1027,7 +1112,8 @@ async def update_event(
         f"{EVENTS_SERVICE_URL}/events/{event_id}",
         headers=headers,
         json_data=event_data,
-        params=params
+        params=params,
+        firebase_uid=firebase_uid
     )
 
 
@@ -1035,17 +1121,14 @@ async def update_event(
 async def get_posts(
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level (for logging/audit)
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
     interest_id: Optional[int] = None,
     created_by: Optional[int] = None
 ):
-    """Delegate to Feed Service with query parameters"""
-    authorization = get_auth_header(request)
+    """Delegate to Feed Service with query parameters. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     params: Dict[str, Any] = {"skip": skip, "limit": limit}
     if interest_id:
@@ -1058,7 +1141,8 @@ async def get_posts(
         f"{FEED_SERVICE_URL}/posts/",
         headers=headers,
         params=params,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     # Return JSONResponse with headers from the Response object
     response_headers = dict(response.headers)
@@ -1067,19 +1151,17 @@ async def get_posts(
 @router.get("/posts/interests")
 async def get_post_interests(
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Feed Service - Get all available interests for posts"""
-    authorization = get_auth_header(request)
+    """Delegate to Feed Service - Get all available interests for posts. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     try:
         result = await forward_request(
             "GET",
             f"{FEED_SERVICE_URL}/posts/interests/",
-            headers=headers
+            headers=headers,
+            firebase_uid=firebase_uid
         )
         # Ensure we return a list - use JSONResponse to avoid FastAPI validation issues
         if isinstance(result, list):
@@ -1101,19 +1183,17 @@ async def get_post(
     post_id: int,
     request: Request,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
-    """Delegate to Feed Service"""
-    authorization = get_auth_header(request)
+    """Delegate to Feed Service. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     result = await forward_request(
         "GET",
         f"{FEED_SERVICE_URL}/posts/{post_id}",
         headers=headers,
-        response_obj=response
+        response_obj=response,
+        firebase_uid=firebase_uid
     )
     # Return JSONResponse with headers from the Response object
     response_headers = dict(response.headers)
@@ -1125,20 +1205,19 @@ async def create_post(
     post: Dict[str, Any],
     response: Response,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid),  # Authentication at composite level
-    decoded_token: dict = Depends(get_verified_token)  # Get full token for auto-sync
 ):
     """
     Create post - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service (auto-sync if needed)
     3. Pass user_id to Feed Service as created_by
     4. Enforce logical FK constraint
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service (auto-syncs if user doesn't exist)
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization, decoded_token)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
@@ -1149,16 +1228,14 @@ async def create_post(
     post["created_by"] = user_id
     # Note: No need to call validate_user_exists - get_user_id_from_firebase_uid already confirms user exists
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     result = await forward_request(
         "POST",
         f"{FEED_SERVICE_URL}/posts/",
         headers=headers,
-        json_data=post
+        json_data=post,
+        firebase_uid=firebase_uid
     )
     
     if "post_id" in result:
@@ -1172,28 +1249,25 @@ async def update_post(
     post_id: int,
     post_data: Dict[str, Any],
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Update post - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service
     3. Pass user_id to Feed Service as query parameter for authorization
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
             detail="User not found. Please sync your account first."
         )
     
-    headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
-    headers["Content-Type"] = "application/json"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     
     # Pass user_id as query parameter for authorization check in Feed Service
     params = {"created_by": user_id}
@@ -1203,7 +1277,8 @@ async def update_post(
         f"{FEED_SERVICE_URL}/posts/{post_id}",
         headers=headers,
         json_data=post_data,
-        params=params
+        params=params,
+        firebase_uid=firebase_uid
     )
 
 
@@ -1211,18 +1286,18 @@ async def update_post(
 async def delete_event(
     event_id: int,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Delete event - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service
     3. Pass user_id to Event Service as query parameter for authorization
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
@@ -1230,8 +1305,6 @@ async def delete_event(
         )
     
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     # Pass user_id as query parameter for authorization check in Event Service
     params = {"created_by": user_id}
@@ -1240,7 +1313,8 @@ async def delete_event(
         "DELETE",
         f"{EVENTS_SERVICE_URL}/events/{event_id}",
         headers=headers,
-        params=params
+        params=params,
+        firebase_uid=firebase_uid
     )
 
 
@@ -1248,18 +1322,18 @@ async def delete_event(
 async def delete_post(
     post_id: int,
     request: Request,
-    firebase_uid: str = Depends(get_firebase_uid)  # Authentication at composite level
 ):
     """
     Delete post - Composite Service workflow:
-    1. Validate Firebase token → firebase_uid
+    1. Get firebase_uid from API Gateway (x-firebase-uid header)
     2. Get user_id from User Service
     3. Pass user_id to Feed Service as query parameter for authorization
+    Trusts x-firebase-uid from API Gateway.
     """
-    authorization = get_auth_header(request)
+    firebase_uid = get_firebase_uid_from_request(request)
     
     # Get user_id from User Service
-    user_id = await get_user_id_from_firebase_uid(firebase_uid, authorization)
+    user_id = await get_user_id_from_firebase_uid(firebase_uid)
     if not user_id:
         raise HTTPException(
             status_code=404,
@@ -1267,8 +1341,6 @@ async def delete_post(
         )
     
     headers: Dict[str, str] = {}
-    if authorization:
-        headers["Authorization"] = authorization
     
     # Pass user_id as query parameter for authorization check in Feed Service
     params = {"created_by": user_id}
@@ -1277,6 +1349,7 @@ async def delete_post(
         "DELETE",
         f"{FEED_SERVICE_URL}/posts/{post_id}",
         headers=headers,
-        params=params
+        params=params,
+        firebase_uid=firebase_uid
     )
 
