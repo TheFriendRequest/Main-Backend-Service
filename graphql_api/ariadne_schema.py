@@ -2,7 +2,6 @@
 GraphQL Schema using Ariadne (more stable than Strawberry)
 """
 from ariadne import QueryType, MutationType, make_executable_schema, gql
-from ariadne.asgi import GraphQL
 from typing import Dict, Any, List, Optional
 import httpx
 import os
