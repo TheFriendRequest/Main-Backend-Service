@@ -31,11 +31,8 @@ def get_task_db_connection():
     return mysql.connector.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASS", os.getenv("DB_PASSWORD", "admin")),
+        password=os.getenv("DB_PASS", "admin"),
         database=os.getenv("TASK_DB_NAME", "task_db"),
-        use_pure=True,
-        port=3306,
-        auth_plugin='mysql_native_password',
     )
 
 # ----------------------
