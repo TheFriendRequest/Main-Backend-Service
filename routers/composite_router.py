@@ -12,7 +12,6 @@ import time
 from pydantic import BaseModel
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# Authentication removed - trust x-firebase-uid header from API Gateway
 
 router = APIRouter(prefix="/api", tags=["Composite"])
 
@@ -669,6 +668,28 @@ async def get_interests(
         print(f"[Composite Service] Unexpected error in get_interests: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+
+@router.get("/users/search")
+async def search_users(request: Request):
+    """Delegate to Users Service - Search for users. Trusts x-firebase-uid from API Gateway."""
+    # Extract q from query params
+    q = request.query_params.get("q")
+    if not q or len(q.strip()) < 1:
+        raise HTTPException(status_code=422, detail="Query parameter 'q' is required and must be at least 1 character")
+    
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/search",
+        headers=headers,
+        params={"q": q},
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
 @router.get("/users/{user_id}")
 async def get_user(
     user_id: int,
@@ -1176,6 +1197,134 @@ async def get_post_interests(
     except Exception as e:
         print(f"[Composite Service] Unexpected error in get_post_interests: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# ----------------------
+# FRIENDSHIP ENDPOINTS
+# ----------------------
+
+@router.post("/friends/requests", status_code=status.HTTP_201_CREATED)
+async def send_friend_request(
+    request: Request,
+    to_user_id: int = Query(...)
+):
+    """Delegate to Users Service - Send friend request. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "POST",
+        f"{USERS_SERVICE_URL}/users/friends/requests",
+        headers=headers,
+        params={"to_user_id": to_user_id},
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.get("/friends/requests/pending")
+async def get_pending_requests(
+    request: Request
+):
+    """Delegate to Users Service - Get incoming pending friend requests. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/friends/requests/pending",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.get("/friends/requests/sent")
+async def get_sent_requests(
+    request: Request
+):
+    """Delegate to Users Service - Get outgoing pending friend requests (requests I sent). Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/friends/requests/sent",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.get("/friends")
+async def get_friends(
+    request: Request
+):
+    """Delegate to Users Service - Get all friends. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "GET",
+        f"{USERS_SERVICE_URL}/users/friends",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.put("/friends/requests/{friendship_id}/accept")
+async def accept_friend_request(
+    friendship_id: int,
+    request: Request
+):
+    """Delegate to Users Service - Accept friend request. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "PUT",
+        f"{USERS_SERVICE_URL}/users/friends/requests/{friendship_id}/accept",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.delete("/friends/requests/{friendship_id}/reject")
+async def reject_friend_request(
+    friendship_id: int,
+    request: Request
+):
+    """Delegate to Users Service - Reject friend request. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "DELETE",
+        f"{USERS_SERVICE_URL}/users/friends/requests/{friendship_id}/reject",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
+
+
+@router.delete("/friends/{friendship_id}")
+async def remove_friend(
+    friendship_id: int,
+    request: Request
+):
+    """Delegate to Users Service - Remove friend. Trusts x-firebase-uid from API Gateway."""
+    firebase_uid = get_firebase_uid_from_request(request)
+    headers: Dict[str, str] = {}
+    
+    result = await forward_request(
+        "DELETE",
+        f"{USERS_SERVICE_URL}/users/friends/{friendship_id}",
+        headers=headers,
+        firebase_uid=firebase_uid
+    )
+    return result
 
 
 @router.get("/posts/{post_id}")
